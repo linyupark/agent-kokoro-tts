@@ -3,6 +3,7 @@ services:
     build: .
     image: kokoro-tts:latest
     container_name: kokoro-tts
+    network_mode: bridge
     ports:
       - "${PORT:-8000}:8000"
     environment:
