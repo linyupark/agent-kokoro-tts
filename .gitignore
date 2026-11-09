@@ -16,3 +16,4 @@ __pycache__/
 # misc
 smoke_out/
 *.part
+skill/verify/
