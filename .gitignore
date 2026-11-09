@@ -1,0 +1,18 @@
+# secrets & local config
+.env
+skill/config.json
+
+# models & runtime data (downloaded at deploy/build time)
+data/
+models/
+*.onnx
+*.bin
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# misc
+smoke_out/
+*.part

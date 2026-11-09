@@ -1,0 +1,7 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.7
+kokoro-onnx>=0.6.1
+soundfile>=0.13
+numpy>=1.26
+misaki-fork[zh]>=0.9

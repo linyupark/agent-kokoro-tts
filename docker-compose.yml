@@ -1,0 +1,24 @@
+services:
+  kokoro-tts:
+    build: .
+    image: kokoro-tts:latest
+    container_name: kokoro-tts
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      API_TOKEN: ${API_TOKEN:-}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      SYNC_ON_STARTUP: ${SYNC_ON_STARTUP:-true}
+      DEFAULT_PEAK_TARGET: ${DEFAULT_PEAK_TARGET:-0.95}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-v1.1-zh}
+    volumes:
+      - ./data:/app/data
+    mem_limit: ${MEM_LIMIT:-2g}
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
