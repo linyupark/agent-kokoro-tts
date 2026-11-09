@@ -36,11 +36,22 @@ def create_app() -> FastAPI:
         app.state.run_sync = run_sync
 
         if settings.sync_on_startup:
-            try:
-                summary = await run_sync()
-                log.info("启动音色同步完成: %s", {k: (v.get("added"), v.get("error")) for k, v in summary.items()})
-            except Exception as exc:  # noqa: BLE001 - offline boot must still work
-                log.warning("启动音色同步失败(使用本地音色包继续): %s", exc)
+            # Run the initial sync in the background: hf-mirror can take many
+            # minutes for 157 .pt files, and the API must come up immediately
+            # (serving seed voices until the sync hot-reloads).
+            async def _startup_sync() -> None:
+                try:
+                    summary = await run_sync()
+                    engine.reload()
+                    log.info(
+                        "启动音色同步完成(后台): %s",
+                        {k: (v.get("local_total"), len(v.get("failed") or [])) for k, v in summary.items()},
+                    )
+                except Exception as exc:  # noqa: BLE001 - offline boot must still work
+                    log.warning("启动音色同步失败(使用种子音色继续): %s", exc)
+
+            app.state.startup_sync_task = asyncio.create_task(_startup_sync())
+            log.info("后台音色同步已启动(不阻塞服务启动,期间使用种子音色)")
 
         from .watchdog import start_memory_watchdog
 
@@ -51,6 +62,9 @@ def create_app() -> FastAPI:
         watchdog = getattr(app.state, "watchdog_task", None)
         if watchdog is not None:
             watchdog.cancel()
+        sync_task = getattr(app.state, "startup_sync_task", None)
+        if sync_task is not None and not sync_task.done():
+            sync_task.cancel()
 
     app = FastAPI(title="kokoro-tts", version="1.0.0", lifespan=lifespan)
 
