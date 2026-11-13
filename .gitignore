@@ -4,7 +4,8 @@ skill/config.json
 
 # models & runtime data (downloaded at deploy/build time)
 data/
-models/
+models/*
+!models/.gitkeep
 *.onnx
 *.bin
 

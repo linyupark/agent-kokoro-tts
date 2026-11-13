@@ -1,0 +1,7 @@
+.git
+.gitignore
+data
+skill
+.env
+**/__pycache__
+**/*.pyc

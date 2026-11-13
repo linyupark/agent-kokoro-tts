@@ -23,6 +23,31 @@ docker compose up -d --build
 curl http://localhost:8000/health
 ```
 
+### 构建会重新下载模型吗
+
+不会重复下载,除非模型真的更新了:
+
+- 模型在 Dockerfile 的**第一个构建阶段**,只有 `scripts/` 或 `./models` 变了才重建;
+  只改 `app/` 代码时只重做最后几层(秒级),不会再拉 400MB
+- `scripts/download_models.py` 本身幂等:文件存在且大小与 `SIZES` 记录的官方大小一致就跳过;
+  下载时也会核对实际字节数与 `Content-Length`,连接被掐断会丢弃重试(不会再留下"看起来存在、
+  其实短一截"的模型文件)
+- 想连第一次下载也省掉:把已下好的模型放进仓库根的 `./models/`(默认只有 `.gitkeep`,
+  构建时用 `--seed` 直接复用)
+
+  ```bash
+  mkdir -p models
+  # 从旧镜像里把模型捞出来(镜像名见 docker-compose.yml 的 image:)
+  id=$(docker create kokoro-tts:latest)
+  docker cp "$id":/app/models/. models/
+  docker rm "$id"
+  docker compose up -d --build     # 这次不会再联网下模型
+  ```
+
+  需要的 5 个文件:`kokoro-v1.0.fp16.onnx`、`kokoro-v1.1-zh.fp16.onnx`、
+  `voices-v1.0.bin`、`voices-v1.1-zh.bin`、`config.json`;也可以直接
+  `python scripts/download_models.py ./models` 预下载
+
 ## REST API
 
 鉴权:除 `/health` 外均需 `Authorization: Bearer <API_TOKEN>`(或 `?token=`)。
