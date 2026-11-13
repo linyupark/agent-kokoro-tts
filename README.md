@@ -33,7 +33,9 @@ curl http://localhost:8000/health
 | `GET /v1/audio/speech?input=...` | URL 参数版 |
 | `GET /v1/voices?model=&language=&gender=` | 音色元数据(性别/语言/官方评级/标记/特注) |
 | `POST /v1/admin/sync-voices` | 同步官方最新音色并热加载 |
-| `GET /health` | 健康检查(无鉴权) |
+| `GET /v1/admin/state` | 当前 RSS / 已加载模型 / 并发与空闲状态 / 计数 |
+| `POST /v1/admin/unload` | 立刻卸载模型并归还内存(有请求在跑时返回 409) |
+| `GET /health` | 健康检查(无鉴权,返回 `rss_mb`) |
 
 ### 合成参数(`POST /v1/audio/speech`)
 
@@ -98,13 +100,31 @@ python tts.py speak --voice zf_001 --text "千里之行,始于足下。" --out h
 
 ## 资源与稳定性
 
-- 实测(笔记本 CPU):RTF ≈ 0.5~0.7,内存恒定 ~0.9GB(8 轮连续调用 +38MB 后走平,无泄漏)
+- 实测(16 核 CPU,`kokoro-v1.1-zh.fp16.onnx`):RTF ≈ 0.5~0.7;单请求峰值 RSS ~600MB,稳态 ~570MB
+- 为什么内存容易涨上去不回落:
+  - 加载 ONNX session 本身约 +500MB(fp16 权重反序列化 + 图 + 工作区)
+  - `kokoro-onnx` 建 session 时用默认 `SessionOptions`,`enable_cpu_mem_arena=True` —— ORT 的内存池按历史峰值扩张、缩不回去
+  - 并发没有闸门时,每个并发各有一份算子工作区:实测 4 并发长文本峰值 1479MB,且请求结束后不下降
+  - glibc 也会把已 free 的堆页留在 RSS 里,不主动还给系统
+- 相关的四个 env(全部有默认值,不配也能跑):
+
+| env | 默认 | 作用 |
+|---|---|---|
+| `MAX_CONCURRENCY` | `2` | 合成并发上限(信号量,FIFO 排队);设 `1` 最省内存 |
+| `ORT_MEM_ARENA` | `false` | 关掉 ORT CPU 内存池:峰值低、RSS 不涨,单请求慢约 10% |
+| `ORT_INTRA_THREADS` | `4` | 每个推理实例的算子内线程数(核少的机器设 2) |
+| `IDLE_UNLOAD_MIN` | `30` | 连续 N 分钟无请求 → 卸载 session/音色包/中文 G2P,再 `gc` + `malloc_trim`;`0` = 常驻 |
+
+- 空闲卸载实测:合成后 637MB → 空闲 3s 后 **108MB**;并发场景峰值 1307MB → 空闲后 **148MB**;
+  下一个请求冷启动 ~1.2s。可 `POST /v1/admin/unload` 立刻触发,`GET /v1/admin/state` 观测
 - 内存看门狗:每 30 分钟采样,超基线 300MB 或 MEM_LIMIT 85% 告警
-- `MEM_LIMIT` 默认 2g
+- `MEM_LIMIT` 默认 2g:限并发 + 关 arena 后,4 并发长文本峰值 ~1.3g,稳态 < 700MB,空闲 ~110MB
 
 ## 故障排查
 
 - **401**:token 不匹配;skill 的 `config.json` 与服务 `.env` 的 `API_TOKEN` 必须一致
+- **内存不降**:先 `GET /v1/admin/state` 看 `idle_unload_sec` / `unloads_total` / `inflight`;
+  `IDLE_UNLOAD_MIN=0` 表示刻意常驻,`POST /v1/admin/unload` 可立即释放
 - **同步失败**:检查 `HF_ENDPOINT` 可达性;失败不影响启动(种子包兜底)
 - **音色 400**:该音色不在当前组,`GET /v1/voices?model=...` 确认,或触发 sync
 - **声音轻/响**:调 `peak_target`(默认 0.95)+ `volume`

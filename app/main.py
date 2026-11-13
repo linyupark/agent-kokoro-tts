@@ -10,7 +10,7 @@ from fastapi.responses import Response
 
 from .audio import MIME
 from .config import load_settings
-from .engine import EngineError, KokoroEngine
+from .engine import EngineError, KokoroEngine, rss_mb
 from .schemas import SpeechRequest
 from .voice_store import VoiceStore
 
@@ -56,12 +56,16 @@ def create_app() -> FastAPI:
         from .watchdog import start_memory_watchdog
 
         app.state.watchdog_task = await start_memory_watchdog(app)
+        app.state.idle_task = asyncio.create_task(engine.idle_loop())
 
         yield
 
         watchdog = getattr(app.state, "watchdog_task", None)
         if watchdog is not None:
             watchdog.cancel()
+        idle_task = getattr(app.state, "idle_task", None)
+        if idle_task is not None:
+            idle_task.cancel()
         sync_task = getattr(app.state, "startup_sync_task", None)
         if sync_task is not None and not sync_task.done():
             sync_task.cancel()
@@ -80,7 +84,23 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        return {"status": "ok", "rss_mb": round(rss_mb(), 1)}
+
+    @app.get("/v1/admin/state", dependencies=[Depends(require_token)])
+    async def admin_state():
+        return app.state.engine.stats()
+
+    @app.post("/v1/admin/unload", dependencies=[Depends(require_token)])
+    async def admin_unload():
+        """Drop models/voices/G2P now and return RSS to the OS (manual 释放)."""
+        if app.state.engine.inflight:
+            raise HTTPException(status_code=409, detail="正在合成,拒绝卸载,请稍后重试")
+        before, after = await asyncio.to_thread(app.state.engine.unload, "admin")
+        return {
+            "status": "unloaded",
+            "rss_before_mb": round(before, 1),
+            "rss_after_mb": round(after, 1),
+        }
 
     @app.get("/v1/voices", dependencies=[Depends(require_token)])
     async def list_voices(

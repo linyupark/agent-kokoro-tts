@@ -35,6 +35,10 @@ class Settings:
     default_peak_target: float
     sync_on_startup: bool
     default_model: str
+    idle_unload_min: float
+    max_concurrency: int
+    ort_intra_threads: int
+    ort_mem_arena: bool
 
 
 def load_settings() -> Settings:
@@ -54,4 +58,8 @@ def load_settings() -> Settings:
         default_peak_target=_env_float("DEFAULT_PEAK_TARGET", 0.95),
         sync_on_startup=_env_bool("SYNC_ON_STARTUP", True),
         default_model=os.getenv("DEFAULT_MODEL", "v1.1-zh"),
+        idle_unload_min=_env_float("IDLE_UNLOAD_MIN", 30.0),
+        max_concurrency=max(1, int(_env_float("MAX_CONCURRENCY", 2))),
+        ort_intra_threads=int(_env_float("ORT_INTRA_THREADS", 4)),
+        ort_mem_arena=_env_bool("ORT_MEM_ARENA", False),
     )

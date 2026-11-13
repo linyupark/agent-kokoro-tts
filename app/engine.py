@@ -1,13 +1,28 @@
-"""Kokoro engine: lazily loads v1.0 / v1.1-zh models, exposes rich params."""
+"""Kokoro engine: lazily loads v1.0 / v1.1-zh models, exposes rich params.
+
+内存策略(三件事,细节见 README「内存占用」一节):
+
+1. **并发闸门**:`MAX_CONCURRENCY`(默认 2)。同一时刻最多 N 个合成任务在跑;
+   每个并发的 ONNX 推理都有自己的算子工作区,这是 RSS 被顶高的头号原因。
+2. **关闭 ONNX Runtime CPU 内存池**:`ORT_MEM_ARENA=false`(默认)。
+   ORT 默认会保留一块"竞技场"缓存,只涨不落;关掉后算子临时缓冲用完即还。
+3. **空闲释放**:超过 `IDLE_UNLOAD_MIN`(默认 30)分钟没有请求,就把 ONNX
+   session / 音色包 / 中文 G2P 全部丢掉,再 gc + malloc_trim 把 RSS 还给系统;
+   下一个请求按需重新加载(实测 ~1.2s)。`IDLE_UNLOAD_MIN=0` 可关闭。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import gc
 import io
 import logging
 import os
 import re
 import threading
+import time
+from contextlib import suppress
 
 import numpy as np
 
@@ -20,6 +35,25 @@ DEFAULT_VOICE = {"v1.1-zh": {"zh": "zf_001"}, "v1.0": {"en-us": "af_heart", "zh"
 
 # Latin word runs inside Chinese text (brand names, tech terms, ...)
 _LATIN_RUN = re.compile(r"[A-Za-z]+(?:['\u2019\-][A-Za-z]+)*")
+
+_PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+
+def rss_mb() -> float:
+    """Current resident set size in MB (stdlib only, no psutil needed)."""
+    try:
+        with open("/proc/self/statm") as fp:
+            return int(fp.read().split()[1]) * _PAGE / 1e6
+    except (OSError, IndexError, ValueError):
+        return 0.0
+
+
+def release_memory() -> float:
+    """gc + glibc malloc_trim: hand freed heap pages back to the OS."""
+    gc.collect()
+    with suppress(Exception):
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    return rss_mb()
 
 
 class EngineError(RuntimeError):
@@ -35,6 +69,35 @@ class KokoroEngine:
         self._thread_lock = threading.Lock()
         self._zh_g2p = None
         self._zh_g2p_error: str | None = None
+        self._voices: dict[str, dict[str, np.ndarray]] = {}
+        self._sem: asyncio.Semaphore | None = None
+        self.last_used = time.monotonic()
+        self.inflight = 0
+        self.unloads = 0
+        self.loads = 0
+        self.errors = 0
+
+    # ---------- concurrency ----------
+
+    def _semaphore(self) -> asyncio.Semaphore:
+        """Bound concurrent syntheses: each parallel run needs its own workspace."""
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(max(1, self._s.max_concurrency))
+        return self._sem
+
+    # ---------- model loading ----------
+
+    def _session_options(self):
+        import onnxruntime as rt
+
+        so = rt.SessionOptions()
+        so.enable_cpu_mem_arena = bool(self._s.ort_mem_arena)  # 默认 False:不保留竞技场
+        so.enable_mem_pattern = False  # 输入长度每次不同,shape 缓存没意义
+        so.inter_op_num_threads = 1
+        if self._s.ort_intra_threads > 0:
+            so.intra_op_num_threads = self._s.ort_intra_threads
+        so.log_severity_level = 3
+        return so
 
     async def _ensure_zh_g2p(self):
         if self._zh_g2p is not None or self._zh_g2p_error is not None:
@@ -86,6 +149,7 @@ class KokoroEngine:
                 return model
 
             def _load():
+                import onnxruntime as rt
                 from kokoro_onnx import Kokoro
 
                 kwargs = {}
@@ -94,17 +158,93 @@ class KokoroEngine:
 
                     if Path(self._s.vocab_config).exists():
                         kwargs["vocab_config"] = self._s.vocab_config
-                return Kokoro(self._model_path(group), str(self._store.bin_path(group)), **kwargs)
+                providers = rt.get_available_providers() or ["CPUExecutionProvider"]
+                session = rt.InferenceSession(
+                    self._model_path(group),
+                    sess_options=self._session_options(),
+                    providers=providers,
+                )
+                return Kokoro.from_session(
+                    session, str(self._store.bin_path(group)), **kwargs
+                )
 
             model = await asyncio.to_thread(_load)
             self._kokoro[group] = model
-            log.info("kokoro 模型已加载: %s", group)
+            self.loads += 1
+            log.info("kokoro 模型已加载: %s (RSS %.0fMB)", group, rss_mb())
             return model
+
+    def _voices_for(self, group: str) -> dict[str, np.ndarray]:
+        """Cache the group's voice bin; loading it per request is ~54MB of churn."""
+        voices = self._voices.get(group)
+        if voices is None:
+            voices = self._store.load_group(group)
+            self._voices[group] = voices
+        return voices
 
     def reload(self) -> None:
         """Drop cached models so freshly synced voices take effect."""
         with self._thread_lock:
             self._kokoro.clear()
+            self._voices.clear()
+        release_memory()
+
+    # ---------- idle unload ----------
+
+    def unload(self, reason: str = "manual") -> tuple[float, float]:
+        """Drop every cached model/voice/G2P and hand the memory back to the OS."""
+        before = rss_mb()
+        with self._thread_lock:
+            idle = not self._kokoro and not self._voices and self._zh_g2p is None
+            if idle:
+                return before, before
+            self._kokoro.clear()
+            self._voices.clear()
+            self._zh_g2p = None
+            self._zh_g2p_error = None
+            self.unloads += 1
+        after = release_memory()
+        log.info("内存释放(%s): RSS %.0fMB → %.0fMB", reason, before, after)
+        return before, after
+
+    async def idle_loop(self, interval_sec: float = 20.0) -> None:
+        """Background task: unload after `IDLE_UNLOAD_MIN` minutes without requests."""
+        idle_sec = float(self._s.idle_unload_min) * 60.0
+        if idle_sec <= 0:
+            log.info("空闲释放已关闭(IDLE_UNLOAD_MIN<=0)")
+            return
+        log.info("空闲释放已启用: 连续 %.0f 分钟无请求就卸载(RSS≈%.0fMB)", idle_sec / 60, rss_mb())
+        while True:
+            await asyncio.sleep(min(interval_sec, max(5.0, idle_sec / 4)))
+            try:
+                if self.inflight:
+                    continue
+                if time.monotonic() - self.last_used < idle_sec:
+                    continue
+                await asyncio.to_thread(self.unload, "idle")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - must never kill the task
+                log.exception("空闲释放失败")
+
+    def stats(self) -> dict:
+        return {
+            "rss_mb": round(rss_mb(), 1),
+            "loaded_models": sorted(self._kokoro),
+            "cached_voice_groups": sorted(self._voices),
+            "zh_g2p_loaded": self._zh_g2p is not None,
+            "inflight": self.inflight,
+            "idle_sec": round(time.monotonic() - self.last_used, 1),
+            "idle_unload_sec": round(float(self._s.idle_unload_min) * 60),
+            "max_concurrency": self._s.max_concurrency,
+            "ort_mem_arena": bool(self._s.ort_mem_arena),
+            "ort_intra_threads": self._s.ort_intra_threads,
+            "models_loaded_total": self.loads,
+            "unloads_total": self.unloads,
+            "errors_total": self.errors,
+        }
+
+    # ---------- synthesis ----------
 
     def resolve_style(self, group: str, voices: dict[str, np.ndarray], voice: str | None,
                       blend_voice: str | None, blend_weight: float, lang: str) -> tuple[str | np.ndarray, str]:
@@ -140,8 +280,53 @@ class KokoroEngine:
         continuous: bool,
     ) -> tuple[bytes, int, float, str]:
         """Returns (wav bytes, sample rate, duration sec, resolved voice)."""
+        async with self._semaphore():
+            self.inflight += 1
+            self.last_used = time.monotonic()
+            try:
+                return await self._synthesize(
+                    group=group,
+                    text=text,
+                    phonemes=phonemes,
+                    voice=voice,
+                    blend_voice=blend_voice,
+                    blend_weight=blend_weight,
+                    speed=speed,
+                    language=language,
+                    volume=volume,
+                    peak_target=peak_target,
+                    sentence_pause=sentence_pause,
+                    clause_pause=clause_pause,
+                    trim=trim,
+                    continuous=continuous,
+                )
+            except Exception:
+                self.errors += 1
+                raise
+            finally:
+                self.inflight -= 1
+                self.last_used = time.monotonic()
+
+    async def _synthesize(
+        self,
+        *,
+        group: str,
+        text: str | None,
+        phonemes: str | None,
+        voice: str | None,
+        blend_voice: str | None,
+        blend_weight: float,
+        speed: float,
+        language: str | None,
+        volume: float,
+        peak_target: float,
+        sentence_pause: float,
+        clause_pause: float,
+        trim: bool,
+        continuous: bool,
+    ) -> tuple[bytes, int, float, str]:
         kokoro = await self._get(group)
-        voices = await asyncio.to_thread(self._store.load_group, group)
+        voices = await asyncio.to_thread(self._voices_for, group)
 
         if phonemes:
             lang = language or "en-us"

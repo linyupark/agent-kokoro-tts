@@ -12,6 +12,14 @@ services:
       SYNC_ON_STARTUP: ${SYNC_ON_STARTUP:-true}
       DEFAULT_PEAK_TARGET: ${DEFAULT_PEAK_TARGET:-0.95}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-v1.1-zh}
+      # 并发闸门:同一时刻最多几个合成任务(每个并发都会多吃一份算子工作区)
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-2}
+      # ONNX Runtime 的 CPU 内存池(arena)。false = 用完即还,峰值更低
+      ORT_MEM_ARENA: ${ORT_MEM_ARENA:-false}
+      # 每个推理实例的算子内线程数
+      ORT_INTRA_THREADS: ${ORT_INTRA_THREADS:-4}
+      # 连续多少分钟没有请求就卸载模型并归还内存;0 = 常驻不卸载
+      IDLE_UNLOAD_MIN: ${IDLE_UNLOAD_MIN:-30}
     volumes:
       - ./data:/app/data
     mem_limit: ${MEM_LIMIT:-2g}
